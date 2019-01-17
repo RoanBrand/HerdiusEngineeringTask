@@ -1,18 +1,14 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
-	"errors"
-	"io/ioutil"
 	"log"
 	"net"
 	"sync"
 
+	"github.com/RoanBrand/HerdiusEngineeringTask/auth"
 	pb "github.com/RoanBrand/HerdiusEngineeringTask/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
 )
 
 type server struct {
@@ -25,19 +21,9 @@ func newServer() *server {
 }
 
 func startServer() error {
-	certificate, err := tls.LoadX509KeyPair(
-		"cert/server/localhost.crt",
-		"cert/server/localhost.key",
-	)
-
-	certPool := x509.NewCertPool()
-	caF, err := ioutil.ReadFile("cert/MaxNumberRootCA.crt")
+	tlsConfig, err := auth.LoadServerTLS()
 	if err != nil {
-		return errors.New("failed to load CA cert: " + err.Error())
-	}
-
-	if ok := certPool.AppendCertsFromPEM(caF); !ok {
-		return errors.New("failed to append cert")
+		return err
 	}
 
 	l, err := net.Listen("tcp", "localhost:4596")
@@ -45,18 +31,37 @@ func startServer() error {
 		return err
 	}
 
-	tlsConf := tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{certificate},
-		ClientCAs:    certPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-	}
-
-	opts := []grpc.ServerOption{grpc.Creds(credentials.NewTLS(&tlsConf))}
+	opts := []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsConfig))}
 	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterMaxNumberServer(grpcServer, newServer())
 
 	return grpcServer.Serve(l)
+}
+
+// Serves client, provided the new number and client ID.
+// Returns true if new number is the new max for client.
+func (s *server) serveClient(num int64, cPubKey string) bool {
+	s.cLock.RLock()
+	currMax, ok := s.clients[cPubKey]
+	s.cLock.RUnlock()
+	if !ok {
+		log.Println("new client")
+		s.cLock.Lock()
+		s.clients[cPubKey] = 0
+		s.cLock.Unlock()
+		currMax = 0
+	}
+
+	log.Println("RX from client:", num)
+
+	if num > currMax {
+		s.cLock.RLock() // Only need write lock when changing map, not updating key's value.
+		s.clients[cPubKey] = num
+		s.cLock.RUnlock()
+		return true
+	}
+
+	return false
 }
 
 func (s *server) FindMaxNumber(stream pb.MaxNumber_FindMaxNumberServer) error {
@@ -64,56 +69,24 @@ func (s *server) FindMaxNumber(stream pb.MaxNumber_FindMaxNumberServer) error {
 		in, err := stream.Recv()
 		if err != nil {
 			if err.Error() == "EOF" { // don't want to import io just for this
-				log.Println("client", 1, "closed connection")
+				log.Println("client closed connection")
 				return nil
 			}
 
-			log.Println("error RX from client", 1, ":", err)
+			log.Println("error RX from client:", err)
 			return err
 		}
 
-		errMsg := errors.New("error validating client")
-		peer, ok := peer.FromContext(stream.Context())
-		if !ok {
-			log.Println(errMsg)
-			return errMsg
+		key, err := auth.ValidateClient(stream.Context())
+		if err != nil {
+			log.Println(err)
+			return err
 		}
 
-		tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo)
-		if !ok {
-			log.Println(errMsg)
-			return errMsg
-		}
-
-		cCerts := tlsInfo.State.PeerCertificates
-		if len(cCerts) == 0 {
-			log.Println(errMsg)
-			return errMsg
-		}
-
-		key, _ := x509.MarshalPKIXPublicKey(cCerts[0].PublicKey)
-		cPubKey := string(key)
-
-		s.cLock.RLock()
-		currMax, ok := s.clients[cPubKey]
-		s.cLock.RUnlock()
-		if !ok {
-			log.Println("new client")
-			s.cLock.Lock()
-			s.clients[cPubKey] = 0
-			s.cLock.Unlock()
-			currMax = 0
-		}
-
-		log.Println("RX from client", 1, ":", in.In)
-
-		if in.In > currMax {
-			s.cLock.RLock() // Only need write lock when changing map, not updating key's value.
-			s.clients[cPubKey] = in.In
-			s.cLock.RUnlock()
+		if s.serveClient(in.In, string(key)) {
 			err := stream.Send(&pb.Response{Max: in.In})
 			if err != nil {
-				log.Println("error TX to client", 1, ":", err)
+				log.Println("error TX to client:", err)
 				return err
 			}
 		}

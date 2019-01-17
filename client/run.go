@@ -2,49 +2,35 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"io/ioutil"
 	"log"
 
+	"github.com/RoanBrand/HerdiusEngineeringTask/auth"
 	pb "github.com/RoanBrand/HerdiusEngineeringTask/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-func main() {
-	certificate, err := tls.LoadX509KeyPair(
-		"cert/client/localhost.crt",
-		"cert/client/localhost.key",
-	)
-
-	certPool := x509.NewCertPool()
-	caF, err := ioutil.ReadFile("cert/MaxNumberRootCA.crt")
+func dialServer() (*grpc.ClientConn, error) {
+	tlsConfig, err := auth.LoadClientTLS()
 	if err != nil {
-		log.Fatal("failed to load CA cert:", err)
+		return nil, err
 	}
 
-	if ok := certPool.AppendCertsFromPEM(caF); !ok {
-		log.Fatal("failed to append cert")
-	}
-
-	creds := credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{certificate},
-		RootCAs:      certPool,
-		ServerName:   "localhost",
-	})
-
+	creds := credentials.NewTLS(tlsConfig)
 	conn, err := grpc.Dial("localhost:4596", grpc.WithTransportCredentials(creds))
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
 
-	defer conn.Close()
+	return conn, nil
+}
+
+func performRequests(conn *grpc.ClientConn) error {
 	cl := pb.NewMaxNumberClient(conn)
 
 	str, err := cl.FindMaxNumber(context.Background())
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	done := make(chan struct{})
@@ -71,11 +57,25 @@ func main() {
 
 	str.CloseSend()
 	<-done
+	return nil
 }
 
 func sendNumber(stream pb.MaxNumber_FindMaxNumberClient, n int64) {
 	err := stream.Send(&pb.Request{In: n})
 	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func main() {
+	conn, err := dialServer()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer conn.Close()
+
+	if err := performRequests(conn); err != nil {
 		log.Fatal(err)
 	}
 }
