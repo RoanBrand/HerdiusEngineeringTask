@@ -7,26 +7,21 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"sync"
 
 	pb "github.com/RoanBrand/HerdiusEngineeringTask/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 )
-
-var knownClients = []string{"1"}
 
 type server struct {
 	clients map[string]int64 // client's pub key -> client's max
-	// seems no locks needed as we will only read once populated and compare and update numbers synchronously.
+	cLock   sync.RWMutex
 }
 
 func newServer() *server {
-	s := server{clients: make(map[string]int64, len(knownClients))}
-	for _, c := range knownClients {
-		s.clients[c] = 0
-	}
-
-	return &s
+	return &server{clients: make(map[string]int64, 2)}
 }
 
 func startServer() error {
@@ -51,6 +46,7 @@ func startServer() error {
 	}
 
 	tlsConf := tls.Config{
+		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{certificate},
 		ClientCAs:    certPool,
 		ClientAuth:   tls.RequireAndVerifyClientCert,
@@ -76,17 +72,45 @@ func (s *server) FindMaxNumber(stream pb.MaxNumber_FindMaxNumberServer) error {
 			return err
 		}
 
-		log.Println("RX from client", 1, ":", in.In)
-
-		currMax, ok := s.clients["1"]
+		errMsg := errors.New("error validating client")
+		peer, ok := peer.FromContext(stream.Context())
 		if !ok {
-			err := errors.New("error: unknown client")
-			log.Println(err)
-			return err
+			log.Println(errMsg)
+			return errMsg
 		}
 
+		tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo)
+		if !ok {
+			log.Println(errMsg)
+			return errMsg
+		}
+
+		cCerts := tlsInfo.State.PeerCertificates
+		if len(cCerts) == 0 {
+			log.Println(errMsg)
+			return errMsg
+		}
+
+		key, _ := x509.MarshalPKIXPublicKey(cCerts[0].PublicKey)
+		cPubKey := string(key)
+
+		s.cLock.RLock()
+		currMax, ok := s.clients[cPubKey]
+		s.cLock.RUnlock()
+		if !ok {
+			log.Println("new client")
+			s.cLock.Lock()
+			s.clients[cPubKey] = 0
+			s.cLock.Unlock()
+			currMax = 0
+		}
+
+		log.Println("RX from client", 1, ":", in.In)
+
 		if in.In > currMax {
-			s.clients["1"] = in.In
+			s.cLock.RLock() // Only need write lock when changing map, not updating key's value.
+			s.clients[cPubKey] = in.In
+			s.cLock.RUnlock()
 			err := stream.Send(&pb.Response{Max: in.In})
 			if err != nil {
 				log.Println("error TX to client", 1, ":", err)
