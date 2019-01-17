@@ -1,12 +1,16 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io/ioutil"
 	"log"
 	"net"
 
 	pb "github.com/RoanBrand/HerdiusEngineeringTask/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 var knownClients = []string{"1"}
@@ -26,14 +30,37 @@ func newServer() *server {
 }
 
 func startServer() error {
+	certificate, err := tls.LoadX509KeyPair(
+		"cert/server/localhost.crt",
+		"cert/server/localhost.key",
+	)
+
+	certPool := x509.NewCertPool()
+	caF, err := ioutil.ReadFile("cert/MaxNumberRootCA.crt")
+	if err != nil {
+		return errors.New("failed to load CA cert: " + err.Error())
+	}
+
+	if ok := certPool.AppendCertsFromPEM(caF); !ok {
+		return errors.New("failed to append cert")
+	}
+
 	l, err := net.Listen("tcp", "localhost:4596")
 	if err != nil {
 		return err
 	}
 
-	grpcServer := grpc.NewServer()
+	tlsConf := tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		ClientCAs:    certPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+
+	opts := []grpc.ServerOption{grpc.Creds(credentials.NewTLS(&tlsConf))}
+	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterMaxNumberServer(grpcServer, newServer())
-	return grpcServer.Serve(l) // TODO: TLS?
+
+	return grpcServer.Serve(l)
 }
 
 func (s *server) FindMaxNumber(stream pb.MaxNumber_FindMaxNumberServer) error {
